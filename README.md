@@ -1,17 +1,11 @@
-# Vocabulary Quiz Testing System
+# PHP Single-File Vocabulary Quiz System
 
-Run:
+## Upload to hosting
+1. Upload **index.php** and **config.php** to your hosting root/public_html.
+2. Open `config.php` and set a strong `ADMIN_PANEL_CODE`.
+3. Open your domain in browser.
 
-```bash
-npm install
-cp .env.example .env
-# set ADMIN_PANEL_CODE in your shell or .env manager
-ADMIN_PANEL_CODE=your_secret npm start
-```
-
-Features:
-- User-uploaded vocab tests (no admin)
-- Admin-managed code tests (open/close, mode switch ENG↔UZB, optional timer)
-- Student entry requires name + code
-- Per-test statistics board with 3-level result categorization
-- Dark theme and contact links
+## Notes
+- Main system is in one file: `index.php`.
+- Admin secret is separate in `config.php`.
+- Works on regular PHP hosting (no Node.js required).
