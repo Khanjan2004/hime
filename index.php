@@ -3,41 +3,55 @@ session_start();
 $config = require __DIR__ . '/config.php';
 $adminCode = (string)($config['ADMIN_PANEL_CODE'] ?? 'change_this_secret_code');
 $dbPath = (string)($config['DB_PATH'] ?? (__DIR__ . '/storage.sqlite'));
+$jsonPath = (string)($config['JSON_PATH'] ?? (__DIR__ . '/storage.json'));
 
-$pdo = new PDO('sqlite:' . $dbPath);
-$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-$pdo->exec('PRAGMA journal_mode = WAL');
-$pdo->exec('CREATE TABLE IF NOT EXISTS tests (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  code TEXT NOT NULL UNIQUE,
-  words_json TEXT NOT NULL,
-  mode TEXT NOT NULL,
-  timer_min INTEGER NULL,
-  is_active INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-)');
-$pdo->exec('CREATE TABLE IF NOT EXISTS results (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  test_id INTEGER NOT NULL,
-  username TEXT NOT NULL,
-  correct INTEGER NOT NULL,
-  total INTEGER NOT NULL,
-  percentage INTEGER NOT NULL,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(test_id) REFERENCES tests(id)
-)');
+$storageMode = 'json';
+$pdo = null;
+$storageWarning = null;
 
-// Backward compatibility migration (old DB had no updated_at)
-$testColumns = $pdo->query('PRAGMA table_info(tests)')->fetchAll(PDO::FETCH_ASSOC);
-$hasUpdatedAt = false;
-foreach ($testColumns as $column) {
-    if (($column['name'] ?? '') === 'updated_at') { $hasUpdatedAt = true; break; }
-}
-if (!$hasUpdatedAt) {
-    $pdo->exec("ALTER TABLE tests ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''");
-    $pdo->exec("UPDATE tests SET updated_at = created_at WHERE updated_at = ''");
+if (extension_loaded('pdo_sqlite')) {
+    try {
+        $pdo = new PDO('sqlite:' . $dbPath);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $pdo->exec('PRAGMA journal_mode = WAL');
+        $pdo->exec('CREATE TABLE IF NOT EXISTS tests (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          code TEXT NOT NULL UNIQUE,
+          words_json TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          timer_min INTEGER NULL,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )');
+        $pdo->exec('CREATE TABLE IF NOT EXISTS results (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          test_id INTEGER NOT NULL,
+          username TEXT NOT NULL,
+          correct INTEGER NOT NULL,
+          total INTEGER NOT NULL,
+          percentage INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(test_id) REFERENCES tests(id)
+        )');
+
+        $testColumns = $pdo->query('PRAGMA table_info(tests)')->fetchAll(PDO::FETCH_ASSOC);
+        $hasUpdatedAt = false;
+        foreach ($testColumns as $column) {
+            if (($column['name'] ?? '') === 'updated_at') { $hasUpdatedAt = true; break; }
+        }
+        if (!$hasUpdatedAt) {
+            $pdo->exec("ALTER TABLE tests ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''");
+            $pdo->exec("UPDATE tests SET updated_at = created_at WHERE updated_at = ''");
+        }
+
+        $storageMode = 'sqlite';
+    } catch (Throwable $e) {
+        $storageWarning = 'SQLite unavailable, fallback to JSON storage.';
+    }
+} else {
+    $storageWarning = 'pdo_sqlite extension is not enabled, fallback to JSON storage.';
 }
 
 function jsonOut($payload, int $status = 200): void {
@@ -71,11 +85,32 @@ function normalizeWords($words): array {
     return $clean;
 }
 
-function assembleTests(PDO $pdo, bool $adminView): array {
+function loadJsonStore(string $jsonPath): array {
+    if (!file_exists($jsonPath)) {
+        return ['tests' => [], 'results' => [], 'nextTestId' => 1, 'nextResultId' => 1];
+    }
+    $data = json_decode((string)file_get_contents($jsonPath), true);
+    if (!is_array($data)) {
+        return ['tests' => [], 'results' => [], 'nextTestId' => 1, 'nextResultId' => 1];
+    }
+    $data['tests'] = is_array($data['tests'] ?? null) ? $data['tests'] : [];
+    $data['results'] = is_array($data['results'] ?? null) ? $data['results'] : [];
+    $data['nextTestId'] = (int)($data['nextTestId'] ?? 1);
+    $data['nextResultId'] = (int)($data['nextResultId'] ?? 1);
+    return $data;
+}
+
+function saveJsonStore(string $jsonPath, array $store): void {
+    $json = json_encode($store, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+    if ($json === false) {
+        throw new RuntimeException('JSON encode error');
+    }
+    file_put_contents($jsonPath, $json, LOCK_EX);
+}
+
+function assembleTestsSqlite(PDO $pdo, bool $adminView): array {
     $tests = [];
-    $sql = $adminView
-        ? 'SELECT * FROM tests ORDER BY id DESC'
-        : 'SELECT * FROM tests WHERE is_active = 1 ORDER BY id DESC';
+    $sql = $adminView ? 'SELECT * FROM tests ORDER BY id DESC' : 'SELECT * FROM tests WHERE is_active = 1 ORDER BY id DESC';
     $rows = $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
 
     foreach ($rows as $row) {
@@ -96,24 +131,18 @@ function assembleTests(PDO $pdo, bool $adminView): array {
     if (!$adminView || !$tests) return $tests;
 
     $map = [];
-    foreach ($tests as $i => $t) {
-        $map[$t['id']] = $i;
-    }
+    foreach ($tests as $i => $t) $map[$t['id']] = $i;
 
     $resultRows = $pdo->query('SELECT * FROM results ORDER BY id ASC')->fetchAll(PDO::FETCH_ASSOC);
     foreach ($resultRows as $r) {
         $testId = (string)$r['test_id'];
         if (!isset($map[$testId])) continue;
-
         $idx = $map[$testId];
         $username = $r['username'];
-        $userIndex = null;
 
+        $userIndex = null;
         foreach ($tests[$idx]['results'] as $k => $u) {
-            if ($u['username'] === $username) {
-                $userIndex = $k;
-                break;
-            }
+            if ($u['username'] === $username) { $userIndex = $k; break; }
         }
 
         if ($userIndex === null) {
@@ -133,15 +162,60 @@ function assembleTests(PDO $pdo, bool $adminView): array {
     return $tests;
 }
 
+function assembleTestsJson(array $store, bool $adminView): array {
+    $tests = [];
+    foreach ($store['tests'] as $test) {
+        if (!$adminView && empty($test['isActive'])) continue;
+        $test['results'] = [];
+        $tests[] = $test;
+    }
+
+    usort($tests, static function ($a, $b) {
+        return (int)$b['id'] <=> (int)$a['id'];
+    });
+
+    if (!$adminView || !$tests) return $tests;
+
+    $map = [];
+    foreach ($tests as $i => $t) $map[(string)$t['id']] = $i;
+
+    foreach ($store['results'] as $r) {
+        $testId = (string)($r['testId'] ?? '');
+        if (!isset($map[$testId])) continue;
+        $idx = $map[$testId];
+        $username = (string)($r['username'] ?? '');
+
+        $userIndex = null;
+        foreach ($tests[$idx]['results'] as $k => $u) {
+            if (($u['username'] ?? '') === $username) { $userIndex = $k; break; }
+        }
+
+        if ($userIndex === null) {
+            $tests[$idx]['results'][] = ['username' => $username, 'attempts' => 0, 'scores' => []];
+            $userIndex = count($tests[$idx]['results']) - 1;
+        }
+
+        $tests[$idx]['results'][$userIndex]['attempts']++;
+        $tests[$idx]['results'][$userIndex]['scores'][] = [
+            'correct' => (int)($r['correct'] ?? 0),
+            'total' => (int)($r['total'] ?? 0),
+            'percentage' => (int)($r['percentage'] ?? 0),
+            'date' => (string)($r['createdAt'] ?? '')
+        ];
+    }
+
+    return $tests;
+}
+
 if (isset($_GET['api'])) {
-    $api = $_GET['api'];
+    $api = (string)$_GET['api'];
     $body = inputJson();
 
     if ($api === 'admin-login') {
         $code = trim((string)($body['code'] ?? ''));
         if ($code !== '' && hash_equals($adminCode, $code)) {
             $_SESSION['admin_ok'] = true;
-            jsonOut(['ok' => true]);
+            jsonOut(['ok' => true, 'storage' => $storageMode]);
         }
         jsonOut(['ok' => false], 401);
     }
@@ -153,7 +227,8 @@ if (isset($_GET['api'])) {
 
     if ($api === 'state-get') {
         $adminView = !empty($_SESSION['admin_ok']);
-        jsonOut(['ok' => true, 'admin' => $adminView, 'tests' => assembleTests($pdo, $adminView)]);
+        $tests = $storageMode === 'sqlite' ? assembleTestsSqlite($pdo, $adminView) : assembleTestsJson(loadJsonStore($jsonPath), $adminView);
+        jsonOut(['ok' => true, 'admin' => $adminView, 'tests' => $tests, 'storage' => $storageMode, 'warning' => $storageWarning]);
     }
 
     if ($api === 'test-create') {
@@ -164,17 +239,26 @@ if (isset($_GET['api'])) {
         $timer = isset($body['timerMin']) && $body['timerMin'] !== null ? (int)$body['timerMin'] : null;
         $words = normalizeWords($body['words'] ?? []);
 
-        if ($name === '' || $code === '' || !count($words)) {
-            jsonOut(['ok' => false, 'message' => 'Invalid fields'], 400);
+        if ($name === '' || $code === '' || !count($words)) jsonOut(['ok' => false, 'message' => 'Invalid fields'], 400);
+
+        if ($storageMode === 'sqlite') {
+            $stmt = $pdo->prepare('INSERT INTO tests(name, code, words_json, mode, timer_min, is_active, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)');
+            try {
+                $now = date('Y-m-d H:i:s');
+                $stmt->execute([$name, $code, json_encode($words, JSON_UNESCAPED_UNICODE), $mode, $timer, 1, $now, $now]);
+            } catch (Throwable $e) {
+                jsonOut(['ok' => false, 'message' => 'Code exists'], 409);
+            }
+        } else {
+            $store = loadJsonStore($jsonPath);
+            foreach ($store['tests'] as $t) {
+                if (($t['code'] ?? '') === $code) jsonOut(['ok' => false, 'message' => 'Code exists'], 409);
+            }
+            $now = date('Y-m-d H:i:s');
+            $store['tests'][] = ['id' => (string)$store['nextTestId']++, 'name' => $name, 'code' => $code, 'words' => $words, 'mode' => $mode, 'timerMin' => $timer, 'isActive' => true, 'createdAt' => $now, 'updatedAt' => $now];
+            saveJsonStore($jsonPath, $store);
         }
 
-        $stmt = $pdo->prepare('INSERT INTO tests(name, code, words_json, mode, timer_min, is_active, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)');
-        try {
-            $now = date('Y-m-d H:i:s');
-            $stmt->execute([$name, $code, json_encode($words, JSON_UNESCAPED_UNICODE), $mode, $timer, 1, $now, $now]);
-        } catch (Throwable $e) {
-            jsonOut(['ok' => false, 'message' => 'Code exists'], 409);
-        }
         jsonOut(['ok' => true]);
     }
 
@@ -185,35 +269,67 @@ if (isset($_GET['api'])) {
         $mode = (string)($body['mode'] ?? 'english-uzbek');
         $timer = isset($body['timerMin']) && $body['timerMin'] !== null ? (int)$body['timerMin'] : null;
         $words = normalizeWords($body['words'] ?? []);
+        if ($id < 1 || $name === '' || !count($words)) jsonOut(['ok' => false, 'message' => 'Invalid fields'], 400);
 
-        if ($id < 1 || $name === '' || !count($words)) {
-            jsonOut(['ok' => false, 'message' => 'Invalid fields'], 400);
+        if ($storageMode === 'sqlite') {
+            $stmt = $pdo->prepare('UPDATE tests SET name=?, words_json=?, mode=?, timer_min=?, updated_at=? WHERE id=?');
+            $stmt->execute([$name, json_encode($words, JSON_UNESCAPED_UNICODE), $mode, $timer, date('Y-m-d H:i:s'), $id]);
+        } else {
+            $store = loadJsonStore($jsonPath);
+            $found = false;
+            foreach ($store['tests'] as &$t) {
+                if ((int)$t['id'] === $id) {
+                    $t['name'] = $name;
+                    $t['words'] = $words;
+                    $t['mode'] = $mode;
+                    $t['timerMin'] = $timer;
+                    $t['updatedAt'] = date('Y-m-d H:i:s');
+                    $found = true;
+                    break;
+                }
+            }
+            unset($t);
+            if (!$found) jsonOut(['ok' => false, 'message' => 'Not found'], 404);
+            saveJsonStore($jsonPath, $store);
+        }
+        jsonOut(['ok' => true]);
+    }
+
+    if ($api === 'test-toggle-status' || $api === 'test-toggle-mode' || $api === 'test-delete') {
+        requireAdmin();
+        $id = (int)($body['id'] ?? 0);
+        if ($id < 1) jsonOut(['ok' => false, 'message' => 'Invalid id'], 400);
+
+        if ($storageMode === 'sqlite') {
+            if ($api === 'test-toggle-status') {
+                $pdo->prepare('UPDATE tests SET is_active = CASE WHEN is_active=1 THEN 0 ELSE 1 END, updated_at=? WHERE id=?')->execute([date('Y-m-d H:i:s'), $id]);
+            } elseif ($api === 'test-toggle-mode') {
+                $pdo->prepare("UPDATE tests SET mode = CASE WHEN mode='english-uzbek' THEN 'uzbek-english' ELSE 'english-uzbek' END, updated_at=? WHERE id=?")->execute([date('Y-m-d H:i:s'), $id]);
+            } else {
+                $pdo->prepare('DELETE FROM results WHERE test_id=?')->execute([$id]);
+                $pdo->prepare('DELETE FROM tests WHERE id=?')->execute([$id]);
+            }
+        } else {
+            $store = loadJsonStore($jsonPath);
+            if ($api === 'test-delete') {
+                $store['tests'] = array_values(array_filter($store['tests'], static function ($t) use ($id) { return (int)$t['id'] !== $id; }));
+                $store['results'] = array_values(array_filter($store['results'], static function ($r) use ($id) { return (int)($r['testId'] ?? 0) !== $id; }));
+            } else {
+                foreach ($store['tests'] as &$t) {
+                    if ((int)$t['id'] !== $id) continue;
+                    if ($api === 'test-toggle-status') {
+                        $t['isActive'] = empty($t['isActive']);
+                    } else {
+                        $t['mode'] = ($t['mode'] ?? 'english-uzbek') === 'english-uzbek' ? 'uzbek-english' : 'english-uzbek';
+                    }
+                    $t['updatedAt'] = date('Y-m-d H:i:s');
+                    break;
+                }
+                unset($t);
+            }
+            saveJsonStore($jsonPath, $store);
         }
 
-        $stmt = $pdo->prepare('UPDATE tests SET name=?, words_json=?, mode=?, timer_min=?, updated_at=? WHERE id=?');
-        $stmt->execute([$name, json_encode($words, JSON_UNESCAPED_UNICODE), $mode, $timer, date('Y-m-d H:i:s'), $id]);
-        jsonOut(['ok' => true]);
-    }
-
-    if ($api === 'test-toggle-status') {
-        requireAdmin();
-        $id = (int)($body['id'] ?? 0);
-        $pdo->prepare('UPDATE tests SET is_active = CASE WHEN is_active=1 THEN 0 ELSE 1 END, updated_at=? WHERE id=?')->execute([date('Y-m-d H:i:s'), $id]);
-        jsonOut(['ok' => true]);
-    }
-
-    if ($api === 'test-toggle-mode') {
-        requireAdmin();
-        $id = (int)($body['id'] ?? 0);
-        $pdo->prepare("UPDATE tests SET mode = CASE WHEN mode='english-uzbek' THEN 'uzbek-english' ELSE 'english-uzbek' END, updated_at=? WHERE id=?")->execute([date('Y-m-d H:i:s'), $id]);
-        jsonOut(['ok' => true]);
-    }
-
-    if ($api === 'test-delete') {
-        requireAdmin();
-        $id = (int)($body['id'] ?? 0);
-        $pdo->prepare('DELETE FROM results WHERE test_id=?')->execute([$id]);
-        $pdo->prepare('DELETE FROM tests WHERE id=?')->execute([$id]);
         jsonOut(['ok' => true]);
     }
 
@@ -224,48 +340,70 @@ if (isset($_GET['api'])) {
         $total = (int)($body['total'] ?? 0);
         $percentage = (int)($body['percentage'] ?? 0);
 
-        if ($testId < 1 || $username === '' || $total < 1) {
-            jsonOut(['ok' => false], 400);
+        if ($testId < 1 || $username === '' || $total < 1) jsonOut(['ok' => false], 400);
+
+        if ($storageMode === 'sqlite') {
+            $exists = $pdo->prepare('SELECT id FROM tests WHERE id=? AND is_active=1');
+            $exists->execute([$testId]);
+            if (!$exists->fetchColumn()) jsonOut(['ok' => false], 404);
+            $stmt = $pdo->prepare('INSERT INTO results(test_id, username, correct, total, percentage, created_at) VALUES(?,?,?,?,?,?)');
+            $stmt->execute([$testId, $username, $correct, $total, $percentage, date('Y-m-d H:i:s')]);
+        } else {
+            $store = loadJsonStore($jsonPath);
+            $exists = false;
+            foreach ($store['tests'] as $t) {
+                if ((int)$t['id'] === $testId && !empty($t['isActive'])) { $exists = true; break; }
+            }
+            if (!$exists) jsonOut(['ok' => false], 404);
+            $store['results'][] = ['id' => $store['nextResultId']++, 'testId' => $testId, 'username' => $username, 'correct' => $correct, 'total' => $total, 'percentage' => $percentage, 'createdAt' => date('Y-m-d H:i:s')];
+            saveJsonStore($jsonPath, $store);
         }
 
-        $exists = $pdo->prepare('SELECT id FROM tests WHERE id=? AND is_active=1');
-        $exists->execute([$testId]);
-        if (!$exists->fetchColumn()) jsonOut(['ok' => false], 404);
-
-        $stmt = $pdo->prepare('INSERT INTO results(test_id, username, correct, total, percentage, created_at) VALUES(?,?,?,?,?,?)');
-        $stmt->execute([$testId, $username, $correct, $total, $percentage, date('Y-m-d H:i:s')]);
         jsonOut(['ok' => true]);
     }
 
     if ($api === 'test-export-csv') {
         requireAdmin();
         $id = (int)($body['id'] ?? 0);
-        $testStmt = $pdo->prepare('SELECT name, code FROM tests WHERE id=?');
-        $testStmt->execute([$id]);
-        $test = $testStmt->fetch(PDO::FETCH_ASSOC);
+        if ($id < 1) jsonOut(['ok' => false], 400);
+
+        $test = null;
+        $rows = [];
+
+        if ($storageMode === 'sqlite') {
+            $testStmt = $pdo->prepare('SELECT name, code FROM tests WHERE id=?');
+            $testStmt->execute([$id]);
+            $test = $testStmt->fetch(PDO::FETCH_ASSOC) ?: null;
+            $stmt = $pdo->prepare('SELECT username, correct, total, percentage, created_at FROM results WHERE test_id=? ORDER BY id DESC');
+            $stmt->execute([$id]);
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        } else {
+            $store = loadJsonStore($jsonPath);
+            foreach ($store['tests'] as $t) {
+                if ((int)$t['id'] === $id) { $test = ['name' => $t['name'], 'code' => $t['code']]; break; }
+            }
+            foreach ($store['results'] as $r) {
+                if ((int)($r['testId'] ?? 0) !== $id) continue;
+                $rows[] = ['username' => (string)($r['username'] ?? ''), 'correct' => (int)($r['correct'] ?? 0), 'total' => (int)($r['total'] ?? 0), 'percentage' => (int)($r['percentage'] ?? 0), 'created_at' => (string)($r['createdAt'] ?? '')];
+            }
+            $rows = array_reverse($rows);
+        }
+
         if (!$test) jsonOut(['ok' => false], 404);
 
-        $rows = $pdo->prepare('SELECT username, correct, total, percentage, created_at FROM results WHERE test_id=? ORDER BY id DESC');
-        $rows->execute([$id]);
-        $data = $rows->fetchAll(PDO::FETCH_ASSOC);
-
         $csv = "username,correct,total,percentage,date\n";
-        foreach ($data as $r) {
+        foreach ($rows as $r) {
             $line = [
-                str_replace('"', '""', $r['username']),
+                str_replace('"', '""', (string)$r['username']),
                 (string)$r['correct'],
                 (string)$r['total'],
                 (string)$r['percentage'],
-                str_replace('"', '""', $r['created_at'])
+                str_replace('"', '""', (string)$r['created_at'])
             ];
-            $csv .= '"' . implode('","', $line) . "\"\n";
+            $csv .= '"' . implode('","', $line) . '"' . "\n";
         }
 
-        jsonOut([
-            'ok' => true,
-            'filename' => 'test_' . $test['code'] . '_results.csv',
-            'content' => base64_encode($csv)
-        ]);
+        jsonOut(['ok' => true, 'filename' => 'test_' . $test['code'] . '_results.csv', 'content' => base64_encode($csv)]);
     }
 
     jsonOut(['ok' => false, 'message' => 'Unknown API'], 404);
@@ -312,7 +450,9 @@ let state = {
 
   adminForm: { name: '', code: '', timer: '', mode: 'english-uzbek', words: '' },
   editingTestId: null,
-  viewingStatsTestId: null
+  viewingStatsTestId: null,
+  storageMode: 'unknown',
+  serverWarning: ''
 };
 
 function loadClientState() {
@@ -354,6 +494,8 @@ async function syncState() {
     state.adminLogged = !!data.admin;
     state.adminTests = data.admin ? data.tests : [];
     state.userTests = data.admin ? data.tests.filter(t => t.isActive) : data.tests;
+    state.storageMode = data.storage || 'unknown';
+    state.serverWarning = data.warning || '';
   } catch (_) {
     alert('Server bilan bog\'lanishda xatolik');
   } finally {
@@ -818,6 +960,7 @@ function renderAdminModal() {
           <h2 class="text-3xl font-extrabold text-red-300">Admin Interface</h2>
           <div class="flex gap-2">
             <button onclick="syncState()" class="px-3 py-2 rounded bg-indigo-700 text-white">Yangila</button>
+            <span class="px-3 py-2 rounded bg-gray-700 text-gray-100 text-sm">Storage: ${state.storageMode}</span>
             <button onclick="logoutAdmin()" class="px-3 py-2 rounded bg-yellow-700 text-white">Logout</button>
             <button onclick="closeAdminModal()" class="p-2 rounded-lg hover:bg-gray-800"><i data-lucide="x"></i></button>
           </div>
@@ -910,6 +1053,7 @@ function render() {
         </button>
       </div>
       ${renderMainButtons()}
+      ${state.serverWarning ? `<div class="max-w-6xl mx-auto mb-3 rounded-lg border border-amber-500/60 bg-amber-100 dark:bg-amber-900/40 px-4 py-3 text-amber-800 dark:text-amber-200">⚠️ ${state.serverWarning}</div>` : ''}
       ${renderQuiz()}
     </div>
     ${renderModal()}
